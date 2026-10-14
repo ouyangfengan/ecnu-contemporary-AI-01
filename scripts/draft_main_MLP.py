@@ -17,23 +17,55 @@ DATA_DIR = PROJECT_DIR / 'data'
 RESULTS_DIR = PROJECT_DIR / 'results'
 
 
+class BatchTraceMLPClassifier(MLPClassifier):
+    """记录 Adam 每次更新前的实际小批次损失，不改变优化过程。"""
+
+    def _backprop(
+        self, X, y, sample_weight, activations, deltas,
+        coef_grads, intercept_grads,
+    ):
+        loss, coef_grads, intercept_grads = super()._backprop(
+            X, y, sample_weight, activations, deltas,
+            coef_grads, intercept_grads,
+        )
+        self.batch_trace_.append((self.n_iter_ + 1, X.shape[0], float(loss)))
+        return loss, coef_grads, intercept_grads
+
+
 def plot_best_model_loss(
     best_model, tuning_records,
     output_path=RESULTS_DIR / 'plots' / 'mlp_validation_loss.png',
     records_path=RESULTS_DIR / 'metrics' / 'mlp_best_loss_curve.csv',
+    batch_records_path=RESULTS_DIR / 'metrics' / 'mlp_best_batch_loss.csv',
 ):
-    # 绘制真实训练损失轨迹，以及各参数配置的验证零一损失。
+    # 保留逐轮均值，另存未平滑的每批次原始损失。
     pd.DataFrame({
         'epoch': range(1, len(best_model.loss_curve_) + 1),
         'training_loss_with_regularization': best_model.loss_curve_,
     }).to_csv(records_path, index=False)
-    fig, (train_ax, val_ax) = plt.subplots(1, 2, figsize=(13, 5))
-    train_ax.plot(
-        range(1, len(best_model.loss_curve_) + 1), best_model.loss_curve_
+    batch_records = pd.DataFrame(
+        best_model.batch_trace_,
+        columns=['epoch', 'batch_size', 'training_loss_with_regularization'],
     )
-    train_ax.set_xlabel('Epoch')
-    train_ax.set_ylabel('Training loss (including regularization)')
-    train_ax.set_title('Best MLP: training loss')
+    batch_records.insert(0, 'update', range(1, len(batch_records) + 1))
+    batch_records.to_csv(batch_records_path, index=False)
+    fig, (train_ax, zoom_ax, val_ax) = plt.subplots(1, 3, figsize=(16, 5))
+    train_ax.plot(
+        batch_records['update'],
+        batch_records['training_loss_with_regularization'],
+        linewidth=0.7,
+    )
+    train_ax.set_xlabel('Mini-batch update (batch_size=auto)')
+    train_ax.set_ylabel('Loss before update (incl. L2)')
+    train_ax.set_title('Best MLP: raw mini-batch loss')
+
+    recent = batch_records[batch_records['epoch'] > best_model.n_iter_ - 3]
+    zoom_ax.plot(
+        recent['update'], recent['training_loss_with_regularization'],
+        marker='.', markersize=3, linewidth=0.8,
+    )
+    zoom_ax.set_xlabel('Mini-batch update')
+    zoom_ax.set_title('Last 3 epochs: raw batch losses')
 
     unique_records = [record for record in tuning_records if not record['reused']]
     labels = [
@@ -46,11 +78,15 @@ def plot_best_model_loss(
     val_ax.set_xticks(range(len(labels)), labels, rotation=45, ha='right')
     val_ax.set_ylabel('Validation zero-one loss (1 - accuracy)')
     val_ax.set_title('MLP: validation error by configuration')
-    for ax in (train_ax, val_ax):
+    for ax in (train_ax, zoom_ax, val_ax):
         ax.grid(axis='y', alpha=0.3)
     fig.tight_layout()
     fig.savefig(output_path, dpi=200, bbox_inches='tight')
-    print(f"损失图已保存至：{output_path}；曲线数据：{records_path}", flush=True)
+    print(
+        f"损失图：{output_path}；逐轮数据：{records_path}；"
+        f"原始小批次数据：{batch_records_path}",
+        flush=True,
+    )
     return fig
 
 
@@ -135,13 +171,14 @@ def evaluate_mlp(stage, alpha, hidden_layer_sizes=BASELINE_LAYERS):
     key = (alpha, hidden_layer_sizes)
     reused = key in experiment_cache
     if not reused:
-        model = MLPClassifier(
+        model = BatchTraceMLPClassifier(
             hidden_layer_sizes=hidden_layer_sizes,
             activation='relu',
             alpha=alpha,
             max_iter=300,
             random_state=42,
         )
+        model.batch_trace_ = []
         started = perf_counter()
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter('always', ConvergenceWarning)
